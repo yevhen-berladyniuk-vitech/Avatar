@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import shutil
 from datetime import datetime
@@ -60,36 +62,30 @@ def _parse_args() -> argparse.Namespace:
         help="Optional voice name for the selected TTS backend.",
     )
     parser.add_argument(
-        "--sadtalker-dir",
+        "--docker-image",
         default=None,
-        help="Path to the SadTalker checkout. Defaults to SADTALKER_DIR or ../SadTalker.",
+        help="SadTalker Docker image tag. Defaults to SADTALKER_DOCKER_IMAGE or wawa9000/sadtalker.",
     )
     parser.add_argument(
-        "--sadtalker-checkpoint-dir",
+        "--docker-executable",
         default=None,
-        help="Path to SadTalker checkpoints. Defaults to SADTALKER_CHECKPOINT_DIR or <sadtalker-dir>/checkpoints.",
+        help="Path to the Docker executable. Defaults to DOCKER_EXE or docker on PATH.",
     )
     parser.add_argument(
-        "--sadtalker-conda-env",
-        default="sadtalker",
-        help="Conda environment name used to run SadTalker.",
-    )
-    parser.add_argument(
-        "--sadtalker-conda-exe",
+        "--docker-gpus",
         default=None,
-        help="Path to the conda executable. Defaults to CONDA_EXE or common local installs.",
+        help="Optional value passed to 'docker run --gpus'. Use 'all' to mirror SadTalker's Docker example.",
     )
     parser.add_argument(
-        "--preprocess",
-        default="crop",
-        choices=["crop", "extcrop", "resize", "full", "extfull"],
-        help="SadTalker preprocess mode.",
+        "--docker-platform",
+        default=None,
+        help="Optional value passed to 'docker run --platform'. Defaults to SADTALKER_DOCKER_PLATFORM or linux/amd64 on Apple Silicon.",
     )
     parser.add_argument(
-        "--size",
-        default=256,
-        type=int,
-        help="SadTalker face render size. Common values are 256 and 512.",
+        "--expression-scale",
+        default=1.0,
+        type=float,
+        help="SadTalker expression scale.",
     )
     parser.add_argument(
         "--enhancer",
@@ -127,6 +123,9 @@ def _resolve_output_paths(
 def main() -> None:
     args = _parse_args()
 
+    if args.cpu and args.docker_gpus:
+        raise SystemExit("Choose either --cpu or --docker-gpus, not both.")
+
     source_image = Path(args.input).expanduser().resolve()
     if not source_image.is_file():
         raise SystemExit(f"Source image was not found: {source_image}")
@@ -156,12 +155,11 @@ def main() -> None:
         source_image_path=source_image,
         audio_path=wav_path,
         output_path=mp4_path,
-        sadtalker_dir=args.sadtalker_dir,
-        checkpoint_dir=args.sadtalker_checkpoint_dir,
-        conda_executable=args.sadtalker_conda_exe,
-        conda_env_name=args.sadtalker_conda_env,
-        preprocess=args.preprocess,
-        size=args.size,
+        docker_image=args.docker_image,
+        docker_executable=args.docker_executable,
+        docker_gpus=args.docker_gpus,
+        docker_platform=args.docker_platform,
+        expression_scale=args.expression_scale,
         enhancer=args.enhancer,
         still=args.still,
         cpu=args.cpu,

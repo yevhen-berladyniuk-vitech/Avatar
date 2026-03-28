@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import os
+import platform
 import shutil
 import subprocess
 import tempfile
@@ -7,31 +10,23 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 AVATAR_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SADTALKER_ENV_NAME = "sadtalker"
+DEFAULT_SADTALKER_DOCKER_IMAGE = "wawa9000/sadtalker"
+CONTAINER_HOST_DIR = Path("/host_dir")
+CONTAINER_RESULT_DIR = CONTAINER_HOST_DIR / "results"
+CONTAINER_PATCH_ENTRY = Path("/app/SadTalker/run_with_avatar_patch.py")
+LOCAL_PATCH_ENTRY = AVATAR_ROOT / "pipeline" / "sadtalker_container_entry.py"
 
 
-def _default_sadtalker_dir() -> Path:
-    configured_dir = os.environ.get("SADTALKER_DIR")
-    if configured_dir:
-        return Path(configured_dir).expanduser()
-    return AVATAR_ROOT.parent / "SadTalker"
-
-
-def _default_checkpoint_dir(sadtalker_dir: Path) -> Path:
-    configured_dir = os.environ.get("SADTALKER_CHECKPOINT_DIR")
-    if configured_dir:
-        return Path(configured_dir).expanduser()
-    return sadtalker_dir / "checkpoints"
+def _default_docker_image() -> str:
+    return os.environ.get("SADTALKER_DOCKER_IMAGE", DEFAULT_SADTALKER_DOCKER_IMAGE)
 
 
 @dataclass(frozen=True)
 class SadTalkerConfig:
-    sadtalker_dir: Path
-    checkpoint_dir: Path
-    conda_executable: Path
-    conda_env_name: str = DEFAULT_SADTALKER_ENV_NAME
-    preprocess: str = "crop"
-    size: int = 256
+    docker_executable: Path
+    docker_image: str = DEFAULT_SADTALKER_DOCKER_IMAGE
+    docker_gpus: Optional[str] = None
+    docker_platform: Optional[str] = None
     pose_style: int = 0
     batch_size: int = 2
     expression_scale: float = 1.0
@@ -42,70 +37,111 @@ class SadTalkerConfig:
     keep_intermediate: bool = False
 
 
-def _find_conda_executable(explicit_path: Optional[Path]) -> Path:
+def _resolve_executable(candidate: Path | str) -> Optional[Path]:
+    candidate_text = str(candidate)
+    direct_path = Path(candidate_text).expanduser()
+    if direct_path.is_file():
+        return direct_path.resolve()
+
+    discovered_path = shutil.which(candidate_text)
+    if discovered_path:
+        return Path(discovered_path).resolve()
+
+    return None
+
+
+def _find_docker_executable(explicit_path: Optional[Path | str]) -> Path:
     candidates = []
     if explicit_path is not None:
-        candidates.append(explicit_path.expanduser())
+        candidates.append(explicit_path)
 
-    conda_env_value = os.environ.get("CONDA_EXE")
-    if conda_env_value:
-        candidates.append(Path(conda_env_value).expanduser())
+    docker_env_value = os.environ.get("DOCKER_EXE")
+    if docker_env_value:
+        candidates.append(docker_env_value)
 
-    which_conda = shutil.which("conda")
-    if which_conda:
-        candidates.append(Path(which_conda))
-
+    candidates.append("docker")
     candidates.extend(
-        Path(candidate).expanduser()
-        for candidate in (
-            "~/miniconda3/bin/conda",
-            "~/anaconda3/bin/conda",
-            "~/miniforge3/bin/conda",
-            "~/mambaforge/bin/conda",
-        )
+        [
+            "/Applications/Docker.app/Contents/Resources/bin/docker",
+            "/usr/local/bin/docker",
+            "/opt/homebrew/bin/docker",
+        ]
     )
 
     for candidate in candidates:
-        if candidate.is_file():
-            return candidate
+        resolved_candidate = _resolve_executable(candidate)
+        if resolved_candidate is not None:
+            return resolved_candidate
 
     raise FileNotFoundError(
-        "Could not locate the conda executable. Set CONDA_EXE or pass --sadtalker-conda-exe."
+        "Could not locate the docker executable. Install Docker or pass --docker-executable."
     )
+
+
+def _containerize_path(host_root: Path, host_path: Path) -> str:
+    return str(CONTAINER_HOST_DIR / host_path.relative_to(host_root))
+
+
+def _default_docker_platform() -> Optional[str]:
+    configured_platform = os.environ.get("SADTALKER_DOCKER_PLATFORM")
+    if configured_platform:
+        return configured_platform
+
+    machine = platform.machine().lower()
+    if machine in {"arm64", "aarch64"}:
+        return "linux/amd64"
+
+    return None
 
 
 def _build_inference_command(
     config: SadTalkerConfig,
+    mounted_host_dir: Path,
+    patch_entry_path: Path,
     source_image: Path,
     audio_path: Path,
     result_dir: Path,
 ) -> list[str]:
     command = [
-        str(config.conda_executable),
+        str(config.docker_executable),
         "run",
-        "-n",
-        config.conda_env_name,
-        "python",
-        "inference.py",
-        "--driven_audio",
-        str(audio_path),
-        "--source_image",
-        str(source_image),
-        "--checkpoint_dir",
-        str(config.checkpoint_dir),
-        "--result_dir",
-        str(result_dir),
-        "--preprocess",
-        config.preprocess,
-        "--size",
-        str(config.size),
-        "--pose_style",
-        str(config.pose_style),
-        "--batch_size",
-        str(config.batch_size),
-        "--expression_scale",
-        str(config.expression_scale),
+        "--rm",
     ]
+
+    if config.docker_gpus:
+        command.extend(["--gpus", config.docker_gpus])
+    if config.docker_platform:
+        command.extend(["--platform", config.docker_platform])
+
+    command.extend(
+        [
+            "-v",
+            f"{mounted_host_dir}:{CONTAINER_HOST_DIR}",
+            "-v",
+            f"{patch_entry_path}:{CONTAINER_PATCH_ENTRY}:ro",
+            "--entrypoint",
+            "python3",
+            config.docker_image,
+            str(CONTAINER_PATCH_ENTRY),
+        ]
+    )
+
+    command.extend(
+        [
+            "--driven_audio",
+            _containerize_path(mounted_host_dir, audio_path),
+            "--source_image",
+            _containerize_path(mounted_host_dir, source_image),
+            "--result_dir",
+            _containerize_path(mounted_host_dir, result_dir),
+            "--pose_style",
+            str(config.pose_style),
+            "--batch_size",
+            str(config.batch_size),
+            "--expression_scale",
+            str(config.expression_scale),
+        ]
+    )
 
     if config.enhancer:
         command.extend(["--enhancer", config.enhancer])
@@ -120,17 +156,23 @@ def _build_inference_command(
 
 
 def _resolve_output_video(result_dir: Path) -> Path:
-    candidates = sorted(result_dir.glob("*.mp4"), key=lambda item: item.stat().st_mtime)
+    candidates = sorted(result_dir.rglob("*.mp4"), key=lambda item: item.stat().st_mtime)
     if not candidates:
         raise FileNotFoundError(
             f"SadTalker finished without producing an MP4 in {result_dir}."
         )
+    final_candidates = [candidate for candidate in candidates if "temp_" not in candidate.name]
+    if final_candidates:
+        return final_candidates[-1]
     return candidates[-1]
 
 
 def _run_command(command: Sequence[str], cwd: Path, env: dict[str, str]) -> None:
     try:
         subprocess.run(command, cwd=cwd, check=True, env=env)
+    except FileNotFoundError as exc:
+        rendered_command = " ".join(str(part) for part in command)
+        raise RuntimeError(f"Failed to launch Docker command: {rendered_command}") from exc
     except subprocess.CalledProcessError as exc:
         rendered_command = " ".join(str(part) for part in command)
         raise RuntimeError(f"SadTalker command failed: {rendered_command}") from exc
@@ -141,12 +183,10 @@ def generate_talking_head(
     audio_path: Path | str,
     output_path: Path | str,
     *,
-    sadtalker_dir: Optional[Path | str] = None,
-    checkpoint_dir: Optional[Path | str] = None,
-    conda_executable: Optional[Path | str] = None,
-    conda_env_name: str = DEFAULT_SADTALKER_ENV_NAME,
-    preprocess: str = "crop",
-    size: int = 256,
+    docker_executable: Optional[Path | str] = None,
+    docker_image: Optional[str] = None,
+    docker_gpus: Optional[str] = None,
+    docker_platform: Optional[str] = None,
     pose_style: int = 0,
     batch_size: int = 2,
     expression_scale: float = 1.0,
@@ -165,33 +205,11 @@ def generate_talking_head(
     if not driven_audio.is_file():
         raise FileNotFoundError(f"Driven audio was not found: {driven_audio}")
 
-    resolved_sadtalker_dir = (
-        Path(sadtalker_dir).expanduser().resolve()
-        if sadtalker_dir is not None
-        else _default_sadtalker_dir().resolve()
-    )
-    if not resolved_sadtalker_dir.is_dir():
-        raise FileNotFoundError(f"SadTalker directory was not found: {resolved_sadtalker_dir}")
-
-    resolved_checkpoint_dir = (
-        Path(checkpoint_dir).expanduser().resolve()
-        if checkpoint_dir is not None
-        else _default_checkpoint_dir(resolved_sadtalker_dir).resolve()
-    )
-    if not resolved_checkpoint_dir.is_dir():
-        raise FileNotFoundError(
-            f"SadTalker checkpoint directory was not found: {resolved_checkpoint_dir}"
-        )
-
     config = SadTalkerConfig(
-        sadtalker_dir=resolved_sadtalker_dir,
-        checkpoint_dir=resolved_checkpoint_dir,
-        conda_executable=_find_conda_executable(
-            Path(conda_executable) if conda_executable is not None else None
-        ).resolve(),
-        conda_env_name=conda_env_name,
-        preprocess=preprocess,
-        size=size,
+        docker_executable=_find_docker_executable(docker_executable),
+        docker_image=docker_image or _default_docker_image(),
+        docker_gpus=docker_gpus or os.environ.get("SADTALKER_DOCKER_GPUS") or None,
+        docker_platform=docker_platform or _default_docker_platform(),
         pose_style=pose_style,
         batch_size=batch_size,
         expression_scale=expression_scale,
@@ -203,32 +221,32 @@ def generate_talking_head(
     )
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    result_dir = Path(
+    workspace_dir = Path(
         tempfile.mkdtemp(prefix=f"{output_file.stem}_sadtalker_", dir=output_file.parent)
     )
-    numba_cache_dir = output_file.parent / ".numba-cache"
-    matplotlib_config_dir = output_file.parent / ".matplotlib"
-    pycache_dir = output_file.parent / ".pycache"
-    numba_cache_dir.mkdir(parents=True, exist_ok=True)
-    matplotlib_config_dir.mkdir(parents=True, exist_ok=True)
-    pycache_dir.mkdir(parents=True, exist_ok=True)
+    if not LOCAL_PATCH_ENTRY.is_file():
+        raise FileNotFoundError(f"SadTalker patch entry was not found: {LOCAL_PATCH_ENTRY}")
+    staged_source_image = workspace_dir / f"source_image{source_image.suffix}"
+    staged_audio_path = workspace_dir / f"driven_audio{driven_audio.suffix}"
+    result_dir = workspace_dir / CONTAINER_RESULT_DIR.name
+    shutil.copy2(source_image, staged_source_image)
+    shutil.copy2(driven_audio, staged_audio_path)
+    result_dir.mkdir(parents=True, exist_ok=True)
 
     command = _build_inference_command(
         config=config,
-        source_image=source_image,
-        audio_path=driven_audio,
+        mounted_host_dir=workspace_dir,
+        patch_entry_path=LOCAL_PATCH_ENTRY.resolve(),
+        source_image=staged_source_image,
+        audio_path=staged_audio_path,
         result_dir=result_dir,
     )
-    command_env = os.environ.copy()
-    command_env["NUMBA_CACHE_DIR"] = str(numba_cache_dir)
-    command_env["MPLCONFIGDIR"] = str(matplotlib_config_dir)
-    command_env["PYTHONPYCACHEPREFIX"] = str(pycache_dir)
 
     try:
-        _run_command(command, cwd=config.sadtalker_dir, env=command_env)
+        _run_command(command, cwd=workspace_dir, env=os.environ.copy())
         raw_output_video = _resolve_output_video(result_dir)
         shutil.copy2(raw_output_video, output_file)
         return output_file
     finally:
         if not config.keep_intermediate:
-            shutil.rmtree(result_dir, ignore_errors=True)
+            shutil.rmtree(workspace_dir, ignore_errors=True)
