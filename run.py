@@ -9,13 +9,25 @@ from typing import Optional
 from pipeline import generate_speech, generate_talking_head
 
 DEFAULT_OUTPUT_DIR = Path("samples/output")
+SUPPORTED_SOURCE_EXTENSIONS = {
+    ".avi",
+    ".bmp",
+    ".jpeg",
+    ".jpg",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".png",
+    ".webp",
+}
 
 
-def _default_output_stem(source_image: Path) -> str:
+def _default_output_stem(source_media: Path) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     sanitized_stem = "".join(
         character if character.isalnum() or character in {"-", "_"} else "-"
-        for character in source_image.stem
+        for character in source_media.stem
     ).strip("-")
     if not sanitized_stem:
         sanitized_stem = "avatar"
@@ -24,7 +36,7 @@ def _default_output_stem(source_image: Path) -> str:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate a speech WAV and SadTalker MP4 from a single input portrait."
+        description="Generate a speech WAV and SadTalker MP4 from an input image or video."
     )
     speech_source_group = parser.add_mutually_exclusive_group(required=True)
     speech_source_group.add_argument(
@@ -38,7 +50,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         required=True,
-        help="Path to the source portrait image.",
+        help="Path to the source image or video.",
     )
     parser.add_argument(
         "--output-dir",
@@ -48,13 +60,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-stem",
         default=None,
-        help="Base filename for the generated assets. Defaults to the image stem plus a timestamp.",
-    )
-    parser.add_argument(
-        "--tts-engine",
-        default="auto",
-        choices=["auto", "kokoro", "macos_say"],
-        help="TTS backend. 'auto' tries Kokoro first and falls back to macOS 'say'.",
+        help="Base filename for the generated assets. Defaults to the input stem plus a timestamp.",
     )
     parser.add_argument(
         "--voice",
@@ -62,30 +68,44 @@ def _parse_args() -> argparse.Namespace:
         help="Optional voice name for the selected TTS backend.",
     )
     parser.add_argument(
-        "--docker-image",
+        "--sadtalker-dir",
         default=None,
-        help="SadTalker Docker image tag. Defaults to SADTALKER_DOCKER_IMAGE or wawa9000/sadtalker.",
+        help="Path to the local SadTalker checkout. Defaults to SADTALKER_DIR.",
     )
     parser.add_argument(
-        "--docker-executable",
+        "--checkpoint-dir",
         default=None,
-        help="Path to the Docker executable. Defaults to DOCKER_EXE or docker on PATH.",
+        help="Path to the SadTalker checkpoints directory. Defaults to SADTALKER_CHECKPOINT_DIR or <sadtalker-dir>/checkpoints.",
     )
     parser.add_argument(
-        "--docker-gpus",
+        "--sadtalker-python",
         default=None,
-        help="Optional value passed to 'docker run --gpus'. Use 'all' to mirror SadTalker's Docker example.",
+        help="Python executable used to run SadTalker locally. Defaults to SADTALKER_PYTHON or the current Python interpreter.",
     )
     parser.add_argument(
-        "--docker-platform",
-        default=None,
-        help="Optional value passed to 'docker run --platform'. Defaults to SADTALKER_DOCKER_PLATFORM or linux/amd64 on Apple Silicon.",
+        "--runtime",
+        default="cpu-gpu",
+        choices=["cpu", "cpu-gpu"],
+        help="SadTalker execution mode. 'cpu-gpu' lets SadTalker use CUDA when available and otherwise falls back to CPU.",
     )
     parser.add_argument(
         "--expression-scale",
         default=1.0,
         type=float,
         help="SadTalker expression scale.",
+    )
+    parser.add_argument(
+        "--preprocess",
+        default="crop",
+        choices=["crop", "extcrop", "resize", "full", "extfull"],
+        help="SadTalker preprocessing mode for the source image or first video frame.",
+    )
+    parser.add_argument(
+        "--size",
+        default=256,
+        type=int,
+        choices=[256, 512],
+        help="SadTalker face model resolution.",
     )
     parser.add_argument(
         "--enhancer",
@@ -99,11 +119,6 @@ def _parse_args() -> argparse.Namespace:
         help="Use SadTalker still mode for less aggressive motion.",
     )
     parser.add_argument(
-        "--cpu",
-        action="store_true",
-        help="Force SadTalker to run with --cpu.",
-    )
-    parser.add_argument(
         "--keep-sadtalker-temp",
         action="store_true",
         help="Keep SadTalker's temporary working directory under the output directory.",
@@ -112,27 +127,34 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _resolve_output_paths(
-    source_image: Path,
+    source_media: Path,
     output_dir: Path,
     requested_stem: Optional[str],
 ) -> tuple[Path, Path]:
-    stem = requested_stem or _default_output_stem(source_image)
+    stem = requested_stem or _default_output_stem(source_media)
     return output_dir / f"{stem}.wav", output_dir / f"{stem}.mp4"
+
+
+def _validate_source_media(source_media: Path) -> None:
+    if not source_media.is_file():
+        raise SystemExit(f"Source input was not found: {source_media}")
+
+    if source_media.suffix.lower() not in SUPPORTED_SOURCE_EXTENSIONS:
+        supported_extensions = ", ".join(sorted(SUPPORTED_SOURCE_EXTENSIONS))
+        raise SystemExit(
+            f"Unsupported input type for {source_media}. Use one of: {supported_extensions}"
+        )
 
 
 def main() -> None:
     args = _parse_args()
 
-    if args.cpu and args.docker_gpus:
-        raise SystemExit("Choose either --cpu or --docker-gpus, not both.")
-
-    source_image = Path(args.input).expanduser().resolve()
-    if not source_image.is_file():
-        raise SystemExit(f"Source image was not found: {source_image}")
+    source_media = Path(args.input).expanduser().resolve()
+    _validate_source_media(source_media)
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    wav_path, mp4_path = _resolve_output_paths(source_image, output_dir, args.output_stem)
+    wav_path, mp4_path = _resolve_output_paths(source_media, output_dir, args.output_stem)
 
     if args.audio:
         source_audio = Path(args.audio).expanduser().resolve()
@@ -147,22 +169,22 @@ def main() -> None:
             text=args.text,
             output_path=wav_path,
             voice=args.voice,
-            engine=args.tts_engine,
         )
 
     print(f"Generating talking-head MP4 at {mp4_path}...")
     generate_talking_head(
-        source_image_path=source_image,
+        source_media_path=source_media,
         audio_path=wav_path,
         output_path=mp4_path,
-        docker_image=args.docker_image,
-        docker_executable=args.docker_executable,
-        docker_gpus=args.docker_gpus,
-        docker_platform=args.docker_platform,
+        sadtalker_dir=args.sadtalker_dir,
+        checkpoint_dir=args.checkpoint_dir,
+        sadtalker_python=args.sadtalker_python,
         expression_scale=args.expression_scale,
+        preprocess=args.preprocess,
+        size=args.size,
         enhancer=args.enhancer,
         still=args.still,
-        cpu=args.cpu,
+        cpu=args.runtime == "cpu",
         keep_intermediate=args.keep_sadtalker_temp,
     )
 
