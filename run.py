@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from pipeline import generate_speech, generate_talking_head
+from pipeline import generate_lip_sync, generate_speech, generate_talking_head
 
 DEFAULT_OUTPUT_DIR = Path("samples/output")
+VIDEO_STAGES = ("sadtalker", "wav2lip")
 SUPPORTED_SOURCE_EXTENSIONS = {
     ".avi",
     ".bmp",
@@ -36,7 +39,7 @@ def _default_output_stem(source_media: Path) -> str:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate a speech WAV and SadTalker MP4 from an input image or video."
+        description="Run the Avatar pipeline through SadTalker and Wav2Lip refinement."
     )
     speech_source_group = parser.add_mutually_exclusive_group(required=True)
     speech_source_group.add_argument(
@@ -50,7 +53,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         required=True,
-        help="Path to the source image or video.",
+        help="Path to the source image or video for the selected start stage.",
     )
     parser.add_argument(
         "--output-dir",
@@ -83,10 +86,10 @@ def _parse_args() -> argparse.Namespace:
         help="Python executable used to run SadTalker locally. Defaults to SADTALKER_PYTHON or the current Python interpreter.",
     )
     parser.add_argument(
-        "--runtime",
-        default="cpu-gpu",
-        choices=["cpu", "cpu-gpu"],
-        help="SadTalker execution mode. 'cpu-gpu' lets SadTalker use CUDA when available and otherwise falls back to CPU.",
+        "--start-stage",
+        default="sadtalker",
+        choices=VIDEO_STAGES,
+        help="First video stage to run. Use 'wav2lip' to skip SadTalker and lip-sync an existing image/video input.",
     )
     parser.add_argument(
         "--expression-scale",
@@ -117,11 +120,6 @@ def _parse_args() -> argparse.Namespace:
         "--still",
         action="store_true",
         help="Use SadTalker still mode for less aggressive motion.",
-    )
-    parser.add_argument(
-        "--keep-sadtalker-temp",
-        action="store_true",
-        help="Keep SadTalker's temporary working directory under the output directory.",
     )
     return parser.parse_args()
 
@@ -171,22 +169,48 @@ def main() -> None:
             voice=args.voice,
         )
 
-    print(f"Generating talking-head MP4 at {mp4_path}...")
-    generate_talking_head(
-        source_media_path=source_media,
-        audio_path=wav_path,
-        output_path=mp4_path,
-        sadtalker_dir=args.sadtalker_dir,
-        checkpoint_dir=args.checkpoint_dir,
-        sadtalker_python=args.sadtalker_python,
-        expression_scale=args.expression_scale,
-        preprocess=args.preprocess,
-        size=args.size,
-        enhancer=args.enhancer,
-        still=args.still,
-        cpu=args.runtime == "cpu",
-        keep_intermediate=args.keep_sadtalker_temp,
-    )
+    active_video_input = source_media
+    generated_sadtalker_output: Optional[Path] = None
+
+    try:
+        if args.start_stage == "sadtalker":
+            temp_handle, temp_path = tempfile.mkstemp(
+                prefix=f"{mp4_path.stem}_sadtalker_",
+                suffix=".mp4",
+                dir=output_dir,
+            )
+            os.close(temp_handle)
+            Path(temp_path).unlink(missing_ok=True)
+            generated_sadtalker_output = Path(temp_path).resolve()
+            sadtalker_output_path = generated_sadtalker_output
+
+            print(f"Generating talking-head MP4 at {sadtalker_output_path}...")
+            generate_talking_head(
+                source_media_path=source_media,
+                audio_path=wav_path,
+                output_path=sadtalker_output_path,
+                sadtalker_dir=args.sadtalker_dir,
+                checkpoint_dir=args.checkpoint_dir,
+                sadtalker_python=args.sadtalker_python,
+                expression_scale=args.expression_scale,
+                preprocess=args.preprocess,
+                size=args.size,
+                enhancer=args.enhancer,
+                still=args.still,
+                cpu=False,
+                keep_intermediate=False,
+            )
+            active_video_input = sadtalker_output_path
+
+        print(f"Generating lip-synced MP4 at {mp4_path}...")
+        generate_lip_sync(
+            source_media_path=active_video_input,
+            audio_path=wav_path,
+            output_path=mp4_path,
+        )
+    finally:
+        if generated_sadtalker_output is not None:
+            generated_sadtalker_output.unlink(missing_ok=True)
 
     print(f"WAV output: {wav_path}")
     print(f"MP4 output: {mp4_path}")

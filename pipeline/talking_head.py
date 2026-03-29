@@ -7,7 +7,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 AVATAR_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PREPROCESS = "crop"
@@ -40,7 +40,7 @@ class SadTalkerConfig:
     keep_intermediate: bool = False
 
 
-def _resolve_executable(candidate: Path | str) -> Optional[Path]:
+def _resolve_executable(candidate: Union[Path, str]) -> Optional[Path]:
     candidate_text = str(candidate)
     direct_path = Path(candidate_text).expanduser()
     if direct_path.is_file():
@@ -85,10 +85,10 @@ def _python_supports_sadtalker(python_executable: Path) -> bool:
 
 
 def _find_python_executable(
-    explicit_path: Optional[Path | str],
+    explicit_path: Optional[Union[Path, str]],
     sadtalker_dir: Path,
 ) -> Path:
-    candidates: list[Path | str] = []
+    candidates: list[Union[Path, str]] = []
     if explicit_path is not None:
         candidates.append(explicit_path)
 
@@ -130,7 +130,7 @@ def _find_python_executable(
     )
 
 
-def _find_sadtalker_dir(explicit_path: Optional[Path | str]) -> Path:
+def _find_sadtalker_dir(explicit_path: Optional[Union[Path, str]]) -> Path:
     candidates: list[Path] = []
     if explicit_path is not None:
         candidates.append(Path(explicit_path).expanduser())
@@ -153,7 +153,7 @@ def _find_sadtalker_dir(explicit_path: Optional[Path | str]) -> Path:
 
 
 def _find_checkpoint_dir(
-    explicit_path: Optional[Path | str],
+    explicit_path: Optional[Union[Path, str]],
     sadtalker_dir: Path,
 ) -> Path:
     candidates: list[Path] = []
@@ -358,13 +358,13 @@ def _run_command(command: Sequence[str], cwd: Path, env: dict[str, str]) -> None
 
 
 def generate_talking_head(
-    source_media_path: Path | str,
-    audio_path: Path | str,
-    output_path: Path | str,
+    source_media_path: Union[Path, str],
+    audio_path: Union[Path, str],
+    output_path: Union[Path, str],
     *,
-    sadtalker_dir: Optional[Path | str] = None,
-    checkpoint_dir: Optional[Path | str] = None,
-    sadtalker_python: Optional[Path | str] = None,
+    sadtalker_dir: Optional[Union[Path, str]] = None,
+    checkpoint_dir: Optional[Union[Path, str]] = None,
+    sadtalker_python: Optional[Union[Path, str]] = None,
     pose_style: int = 0,
     batch_size: int = 2,
     size: int = DEFAULT_SIZE,
