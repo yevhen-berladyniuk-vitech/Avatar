@@ -1,3 +1,6 @@
+av
 kokoro
 numpy
 soundfile
+torch
+torchvision

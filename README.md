@@ -4,13 +4,16 @@ Single-command prototype for generating:
 
 - a speech `.wav` from input text
 - a SadTalker `.mp4` from one input image or video plus that WAV
+- a RobustVideoMatting `.mp4` with the background removed after SadTalker
 - a Wav2Lip-refined final `.mp4`
 
-The SadTalker and Wav2Lip legs run against local checkouts. Avatar does not modify either codebase.
+SadTalker and Wav2Lip run against local checkouts. RobustVideoMatting is loaded
+from the official TorchHub repository on demand.
 
 ## Prerequisites
 
 - Python 3.9+ for this repo
+- `pip install -r requirements.txt` in this repo's Python environment
 - A local SadTalker checkout with its dependencies installed
 - SadTalker checkpoints downloaded locally
 - A local Wav2Lip checkout with its dependencies installed
@@ -61,6 +64,16 @@ python3 run.py \
   --start-stage wav2lip
 ```
 
+If you already have a generated talking-head video and want to start at the
+background stage, skipping both TTS and SadTalker:
+
+```bash
+python3 run.py \
+  --input samples/output/man-no-Wav2Lip-size512/video.mp4 \
+  --audio samples/output/man-no-Wav2Lip-size512/sound.wav \
+  --start-stage background
+```
+
 Outputs are written to `samples/output/` by default as:
 
 - `<stem>.wav`
@@ -69,6 +82,7 @@ Outputs are written to `samples/output/` by default as:
 ## Notes
 
 - `--input` accepts either an image or a video file. With video input, Avatar passes the file straight to SadTalker, which uses the first frame as the reference source.
+- `--start-stage background` requires a video input because RobustVideoMatting is a video-matting stage.
 - `--start-stage wav2lip` treats `--input` as the existing image/video that should be lip-synced.
 - `--sadtalker-dir`, `--checkpoint-dir`, and `--sadtalker-python` override the corresponding environment variables.
 - If `--sadtalker-python` is not set, Avatar tries a local SadTalker virtualenv first and then common conda env locations such as `~/miniconda3/envs/sadtalker/bin/python`.

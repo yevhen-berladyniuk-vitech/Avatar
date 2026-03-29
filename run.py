@@ -8,10 +8,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from pipeline import generate_lip_sync, generate_speech, generate_talking_head
+from pipeline import (
+    generate_background_video,
+    generate_lip_sync,
+    generate_speech,
+    generate_talking_head,
+)
 
 DEFAULT_OUTPUT_DIR = Path("samples/output")
-VIDEO_STAGES = ("sadtalker", "wav2lip")
+VIDEO_STAGES = ("sadtalker", "background", "wav2lip")
+VIDEO_SOURCE_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4"}
 SUPPORTED_SOURCE_EXTENSIONS = {
     ".avi",
     ".bmp",
@@ -37,9 +43,24 @@ def _default_output_stem(source_media: Path) -> str:
     return f"{sanitized_stem}_{timestamp}"
 
 
+def _create_intermediate_output_path(output_path: Path, stage_name: str) -> Path:
+    temp_handle, temp_path = tempfile.mkstemp(
+        prefix=f"{output_path.stem}_{stage_name}_",
+        suffix=".mp4",
+        dir=output_path.parent,
+    )
+    os.close(temp_handle)
+    intermediate_path = Path(temp_path).resolve()
+    intermediate_path.unlink(missing_ok=True)
+    return intermediate_path
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the Avatar pipeline through SadTalker and Wav2Lip refinement."
+        description=(
+            "Run the Avatar pipeline through SadTalker, background matting, "
+            "and Wav2Lip refinement."
+        )
     )
     speech_source_group = parser.add_mutually_exclusive_group(required=True)
     speech_source_group.add_argument(
@@ -89,7 +110,10 @@ def _parse_args() -> argparse.Namespace:
         "--start-stage",
         default="sadtalker",
         choices=VIDEO_STAGES,
-        help="First video stage to run. Use 'wav2lip' to skip SadTalker and lip-sync an existing image/video input.",
+        help=(
+            "First video stage to run. Use 'background' to skip SadTalker, or "
+            "'wav2lip' to skip both SadTalker and background matting."
+        ),
     )
     parser.add_argument(
         "--expression-scale",
@@ -99,7 +123,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--preprocess",
-        default="crop",
+        default="extcrop",
         choices=["crop", "extcrop", "resize", "full", "extfull"],
         help="SadTalker preprocessing mode for the source image or first video frame.",
     )
@@ -144,11 +168,26 @@ def _validate_source_media(source_media: Path) -> None:
         )
 
 
+def _validate_start_stage_input(source_media: Path, start_stage: str) -> None:
+    if start_stage == "background" and source_media.suffix.lower() not in VIDEO_SOURCE_EXTENSIONS:
+        supported_video_extensions = ", ".join(sorted(VIDEO_SOURCE_EXTENSIONS))
+        raise SystemExit(
+            "The background stage requires a video input. "
+            f"Use one of: {supported_video_extensions}"
+        )
+
+
+def _requested_video_stages(start_stage: str) -> tuple[str, ...]:
+    start_index = VIDEO_STAGES.index(start_stage)
+    return VIDEO_STAGES[start_index:]
+
+
 def main() -> None:
     args = _parse_args()
 
     source_media = Path(args.input).expanduser().resolve()
     _validate_source_media(source_media)
+    _validate_start_stage_input(source_media, args.start_stage)
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -170,19 +209,13 @@ def main() -> None:
         )
 
     active_video_input = source_media
-    generated_sadtalker_output: Optional[Path] = None
+    intermediate_outputs: list[Path] = []
+    requested_stages = _requested_video_stages(args.start_stage)
 
     try:
-        if args.start_stage == "sadtalker":
-            temp_handle, temp_path = tempfile.mkstemp(
-                prefix=f"{mp4_path.stem}_sadtalker_",
-                suffix=".mp4",
-                dir=output_dir,
-            )
-            os.close(temp_handle)
-            Path(temp_path).unlink(missing_ok=True)
-            generated_sadtalker_output = Path(temp_path).resolve()
-            sadtalker_output_path = generated_sadtalker_output
+        if "sadtalker" in requested_stages:
+            sadtalker_output_path = _create_intermediate_output_path(mp4_path, "sadtalker")
+            intermediate_outputs.append(sadtalker_output_path)
 
             print(f"Generating talking-head MP4 at {sadtalker_output_path}...")
             generate_talking_head(
@@ -202,6 +235,17 @@ def main() -> None:
             )
             active_video_input = sadtalker_output_path
 
+        if "background" in requested_stages:
+            background_output_path = _create_intermediate_output_path(mp4_path, "background")
+            intermediate_outputs.append(background_output_path)
+
+            print(f"Generating background-matted MP4 at {background_output_path}...")
+            generate_background_video(
+                source_media_path=active_video_input,
+                output_path=background_output_path,
+            )
+            active_video_input = background_output_path
+
         print(f"Generating lip-synced MP4 at {mp4_path}...")
         generate_lip_sync(
             source_media_path=active_video_input,
@@ -209,8 +253,8 @@ def main() -> None:
             output_path=mp4_path,
         )
     finally:
-        if generated_sadtalker_output is not None:
-            generated_sadtalker_output.unlink(missing_ok=True)
+        for intermediate_output in intermediate_outputs:
+            intermediate_output.unlink(missing_ok=True)
 
     print(f"WAV output: {wav_path}")
     print(f"MP4 output: {mp4_path}")
