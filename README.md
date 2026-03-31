@@ -6,6 +6,7 @@ Single-command prototype for generating:
 - a SadTalker `.mp4` from one input image or video plus that WAV
 - a RobustVideoMatting `.mp4` with the background removed after SadTalker
 - a Wav2Lip-refined final `.mp4`
+- an optional OpenCV hologram pass for an already-matted face video
 
 SadTalker and Wav2Lip run against local checkouts. RobustVideoMatting is loaded
 from the official TorchHub repository on demand.
@@ -78,6 +79,34 @@ Outputs are written to `samples/output/` by default as:
 
 - `<stem>.wav`
 - `<stem>.mp4`
+
+## Standalone Hologram Stage
+
+`pipeline/style.py` is intentionally self-contained so you can skip the earlier
+stages and run just the visual effect on a video that already has the background
+removed by RVM or a similar matting step.
+
+```bash
+python3 pipeline/style.py \
+  --input samples/output/man-no-Wav2Lip-size512/video.mp4 \
+  --output samples/output/man-no-Wav2Lip-size512/video_hologram.mp4
+```
+
+The hologram stage assumes the face is already isolated against a black or
+near-black background. It adds:
+
+- blue/cyan tinting
+- bloom around the subject
+- scanlines
+- bright edge glow
+- subtle ghosting/jitter for a projected look
+
+If the matting result is very dark around the hair or face edges, lower
+`--mask-threshold` a bit so more of the subject is retained.
+
+The stage now preserves the original audio track by remuxing it back into the
+styled MP4 after the OpenCV frame pass. That remux step uses the `av` package
+from this repo's requirements.
 
 ## Notes
 
