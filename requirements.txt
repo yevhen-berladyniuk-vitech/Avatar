@@ -1,3 +1,7 @@
+av
 kokoro
 numpy
+opencv-python-headless
 soundfile
+torch
+torchvision
