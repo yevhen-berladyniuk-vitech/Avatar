@@ -20,6 +20,7 @@ DEFAULT_MASK_THRESHOLD: Final = 8
 DEFAULT_SUBJECT_OPACITY: Final = 0.90
 DEFAULT_RANDOM_SEED: Final = 1337
 DEFAULT_TINT_BGR: Final = (255, 230, 140)
+DEFAULT_BACKGROUND_BGR: Final = (110, 42, 16)
 VIDEO_SOURCE_EXTENSIONS: Final = {".avi", ".m4v", ".mkv", ".mov", ".mp4"}
 REQUIRED_MODULE_PACKAGES: Final = {
     "av": "av",
@@ -362,6 +363,65 @@ def _build_glitch_overlay(
     return shifted * glitch_mask[..., None] * 0.28
 
 
+def _build_dot_matrix_background(
+    cv2_module: object,
+    np_module: object,
+    *,
+    height: int,
+    width: int,
+    frame_index: int,
+) -> object:
+    step_x = 10
+    step_y = 10
+    grid_height = max(1, height // step_y + 2)
+    grid_width = max(1, width // step_x + 2)
+
+    row_ids = np_module.arange(grid_height, dtype=np_module.float32).reshape(-1, 1)
+    col_ids = np_module.arange(grid_width, dtype=np_module.float32).reshape(1, -1)
+
+    head_positions = np_module.mod((frame_index * 0.72) + (col_ids * 1.8), grid_height)
+    trail_lengths = 5.0 + (
+        6.0 * (0.5 + 0.5 * np_module.sin((col_ids * 0.31) + (frame_index * 0.06)))
+    )
+    distances = np_module.mod(row_ids - head_positions, grid_height)
+    trails = np_module.clip(1.0 - (distances / trail_lengths), 0.0, 1.0)
+
+    row_band = 0.35 + (
+        0.65 * (0.5 + 0.5 * np_module.sin((row_ids * 0.42) + (frame_index * 0.04)))
+    )
+    column_band = 0.25 + (
+        0.75 * (0.5 + 0.5 * np_module.sin((col_ids * 0.51) + 0.9))
+    )
+    sparkles = (
+        np_module.mod((row_ids * 1.7) + (col_ids * 2.9) + (frame_index * 0.85), 9.0) < 0.9
+    ).astype(np_module.float32)
+    sparkles *= 0.55
+
+    grid_values = np_module.clip((trails * row_band * column_band) + sparkles, 0.0, 1.0)
+    upsampled_grid = cv2_module.resize(
+        grid_values.astype(np_module.float32),
+        (width, height),
+        interpolation=cv2_module.INTER_NEAREST,
+    )
+
+    y_coords = np_module.arange(height, dtype=np_module.float32).reshape(height, 1)
+    x_coords = np_module.arange(width, dtype=np_module.float32).reshape(1, width)
+    dy = np_module.mod(y_coords - (step_y / 2.0), step_y)
+    dy = np_module.minimum(dy, step_y - dy)
+    dx = np_module.mod(x_coords - (step_x / 2.0), step_x)
+    dx = np_module.minimum(dx, step_x - dx)
+
+    dot_kernel = np_module.exp(-((dx ** 2) + (dy ** 2)) / (2.0 * (1.18 ** 2)))
+    row_line = np_module.exp(-(dy ** 2) / (2.0 * (0.42 ** 2)))
+    column_line = np_module.exp(-(dx ** 2) / (2.0 * (0.55 ** 2)))
+
+    dot_field = upsampled_grid * ((dot_kernel * 1.85) + (row_line * 0.22) + (column_line * 0.06))
+    dot_glow = cv2_module.GaussianBlur(dot_field, (0, 0), 1.3)
+    dot_core = cv2_module.GaussianBlur(dot_field, (0, 0), 0.35)
+
+    return np_module.clip((dot_core * 1.65) + (dot_glow * 0.55), 0.0, 1.0)
+
+
 def _apply_hologram_effect(
     cv2_module: object,
     np_module: object,
@@ -449,13 +509,15 @@ def _apply_hologram_effect(
 
     rows = np_module.arange(height, dtype=np_module.float32).reshape(height, 1)
     cols = np_module.arange(width, dtype=np_module.float32).reshape(1, width)
-    ambient_rain = (
-        (
-            np_module.mod((rows * 0.82) + (cols * 0.13) + (frame_index * 1.8), 11.0) < 1.2
-        ).astype(np_module.float32)
-        * (0.16 + 0.10 * (0.5 + 0.5 * np_module.sin(cols * 0.07)))
+    background_dot_matrix = _build_dot_matrix_background(
+        cv2_module,
+        np_module,
+        height=height,
+        width=width,
+        frame_index=frame_index,
     )
-    ambient_rain = cv2_module.GaussianBlur(ambient_rain, (0, 0), 0.75)
+    ambient_rain = cv2_module.GaussianBlur(background_dot_matrix, (0, 0), 6.0)
+    background_base = np_module.array(DEFAULT_BACKGROUND_BGR, dtype=np_module.float32) / 255.0
     ambient_background = ambient_rain[..., None] * np_module.array(
         [0.06, 0.08, 0.12],
         dtype=np_module.float32,
@@ -464,28 +526,13 @@ def _apply_hologram_effect(
     center_x = (cols - (width / 2.0)) / max(width, 1)
     center_y = (rows - (height * 0.55)) / max(height, 1)
     background_haze = np_module.exp(-((center_x ** 2) * 7.5) - ((center_y ** 2) * 10.0))
-    background = ambient_background + (
+    background = background_base.reshape(1, 1, 3).copy()
+    background = background + ambient_background + (
         background_haze[..., None] * np_module.array([0.05, 0.07, 0.12], dtype=np_module.float32)
     )
-
-    hologram = background
-    hologram += subject_surface * (subject_opacity * 0.46)
-    hologram *= scanlines[..., None]
-    hologram += glow * (glow_strength * 0.42)
-    hologram += aura_mask[..., None] * tint * (glow_strength * 0.28)
-    hologram += edge_color * (edge_strength * 1.55)
-    hologram += digital_rain[..., None] * tint * 0.98
-    hologram += point_cloud[..., None] * accent_tint * 1.28
-    hologram += glitch_overlay
-    hologram += ghost * (ghost_strength * 0.55)
-    hologram += row_noise
-
-    hologram = cv2_module.addWeighted(
-        hologram,
-        1.18,
-        cv2_module.GaussianBlur(hologram, (0, 0), 0.9),
-        -0.18,
-        0.0,
+    background += background_dot_matrix[..., None] * np_module.array(
+        [0.18, 0.30, 0.12],
+        dtype=np_module.float32,
     )
 
     subject_field = np_module.clip(
@@ -493,7 +540,29 @@ def _apply_hologram_effect(
         0.0,
         1.0,
     )
-    hologram *= np_module.clip(subject_field[..., None] + 0.14, 0.0, 1.0)
+    background = background * (0.96 + (0.04 * scanlines[..., None]))
+    background += row_noise * 0.45
+
+    subject_layers = subject_surface * (subject_opacity * 0.46)
+    subject_layers *= scanlines[..., None]
+    subject_layers += glow * (glow_strength * 0.42)
+    subject_layers += aura_mask[..., None] * tint * (glow_strength * 0.28)
+    subject_layers += edge_color * (edge_strength * 1.55)
+    subject_layers += digital_rain[..., None] * tint * 0.98
+    subject_layers += point_cloud[..., None] * accent_tint * 1.28
+    subject_layers += glitch_overlay
+    subject_layers += ghost * (ghost_strength * 0.55)
+    subject_layers += row_noise
+
+    subject_layers = cv2_module.addWeighted(
+        subject_layers,
+        1.18,
+        cv2_module.GaussianBlur(subject_layers, (0, 0), 0.9),
+        -0.18,
+        0.0,
+    )
+
+    hologram = background + (subject_layers * subject_field[..., None])
 
     return np_module.clip(hologram * 255.0, 0.0, 255.0).astype(np_module.uint8)
 
