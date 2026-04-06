@@ -4,9 +4,9 @@ Single-command prototype for generating:
 
 - a speech `.wav` from input text
 - a SadTalker `.mp4` from one input image or video plus that WAV
-- a RobustVideoMatting `.mp4` with the background removed after SadTalker
-- a Wav2Lip-refined final `.mp4`
-- an optional OpenCV hologram pass for an already-matted face video
+- a Wav2Lip-refined intermediate `.mp4`
+- a RobustVideoMatting `.mp4` with the background removed after Wav2Lip
+- a final OpenCV hologram-styled `.mp4`
 
 SadTalker and Wav2Lip run against local checkouts. RobustVideoMatting is loaded
 from the official TorchHub repository on demand.
@@ -24,11 +24,6 @@ Export the SadTalker paths before running:
 ```bash
 export SADTALKER_DIR=/Users/yevhen/PycharmProjects/SadTalker
 export SADTALKER_CHECKPOINT_DIR=/Users/yevhen/PycharmProjects/SadTalker/checkpoints
-```
-
-If SadTalker needs a different Python environment than this repo, also set:
-
-```bash
 export SADTALKER_PYTHON=/Users/yevhen/miniconda3/envs/sadtalker/bin/python3.8
 ```
 
@@ -52,11 +47,21 @@ If you already have a WAV and want to run the full pipeline:
 
 ```bash
 python3 run.py \
-  --input samples/input/women-video-7sec.mp4 \
+  --input samples/input/woman.png \
   --audio path/to/input.wav
 ```
 
-If you want to skip SadTalker and start directly from the Wav2Lip stage with an existing video:
+If you want to stop after TTS + SadTalker + Wav2Lip, without background removal
+or styling:
+
+```bash
+python3 run.py \
+  --input samples/input/men.png \
+  --text "Hello from Avatar" \
+  --end-stage wav2lip
+```
+
+If you want to skip SadTalker and start directly from the Wav2Lip stage with an existing image or video:
 
 ```bash
 python3 run.py \
@@ -65,8 +70,8 @@ python3 run.py \
   --start-stage wav2lip
 ```
 
-If you already have a generated talking-head video and want to start at the
-background stage, skipping both TTS and SadTalker:
+If you already have a lip-synced video and want to start at the background
+stage, skipping both SadTalker and Wav2Lip:
 
 ```bash
 python3 run.py \
@@ -78,43 +83,51 @@ python3 run.py \
 Outputs are written to `samples/output/` by default as:
 
 - `<stem>.wav`
-- `<stem>.mp4`
+- `<stem>.mp4` as the output of the selected `--end-stage`
 
 ## Standalone Hologram Stage
 
 `pipeline/style.py` is intentionally self-contained so you can skip the earlier
-stages and run just the visual effect on a video that already has the background
-removed by RVM or a similar matting step.
+stages and run just the visual effect on an already-isolated portrait image or
+video. It works best when the subject is either against a black or near-black
+background, or stored as a transparent PNG.
+
+For a still image:
 
 ```bash
 python3 pipeline/style.py \
-  --input samples/output/man-no-Wav2Lip-size512/video.mp4 \
-  --output samples/output/man-no-Wav2Lip-size512/video_hologram.mp4
+  --input samples/input/men.png \
+  --output samples/output/men_hologram.png
 ```
 
-The hologram stage assumes the face is already isolated against a black or
-near-black background. It adds:
+For a video:
 
-- blue/cyan tinting
-- bloom around the subject
-- scanlines
-- bright edge glow
-- subtle ghosting/jitter for a projected look
+```bash
+python3 pipeline/style.py \
+  --input samples/output/man-no-Wav2Lip-size512/man_no_back.mp4 \
+  --output samples/output/man-no-Wav2Lip-size512/video_hologram.mp4
+```
 
 If the matting result is very dark around the hair or face edges, lower
 `--mask-threshold` a bit so more of the subject is retained.
 
-The stage now preserves the original audio track by remuxing it back into the
-styled MP4 after the OpenCV frame pass. That remux step uses the `av` package
-from this repo's requirements.
-
 ## Notes
 
 - `--input` accepts either an image or a video file. With video input, Avatar passes the file straight to SadTalker, which uses the first frame as the reference source.
-- `--start-stage background` requires a video input because RobustVideoMatting is a video-matting stage.
-- `--start-stage wav2lip` treats `--input` as the existing image/video that should be lip-synced.
+- `--end-stage wav2lip` stops after lip sync and skips both background removal and styling.
+- `--end-stage background` stops after background removal and skips styling.
+- `--start-stage wav2lip` treats `--input` as the existing image/video that should be lip-synced before background removal.
+- `--start-stage background` requires a video input because RobustVideoMatting is a video-matting stage, and it assumes the input is already lip-synced.
 - `--sadtalker-dir`, `--checkpoint-dir`, and `--sadtalker-python` override the corresponding environment variables.
 - If `--sadtalker-python` is not set, Avatar tries a local SadTalker virtualenv first and then common conda env locations such as `~/miniconda3/envs/sadtalker/bin/python`.
 - `--preprocess full --still` is a useful combination for full-frame inputs.
 - `--size` supports SadTalker's 256 and 512 face models.
 - You can skip TTS entirely with `--audio <existing.wav>`.
+
+
+## Face Crop
+```bash
+python3 pipeline/face_crop.py \
+  --input samples/input/men.png \
+  --output samples/output/men_face.png
+```

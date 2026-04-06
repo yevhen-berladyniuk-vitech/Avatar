@@ -10,13 +10,15 @@ from typing import Optional
 
 from pipeline import (
     generate_background_video,
+    generate_hologram_video,
     generate_lip_sync,
     generate_speech,
     generate_talking_head,
 )
 
 DEFAULT_OUTPUT_DIR = Path("samples/output")
-VIDEO_STAGES = ("sadtalker", "background", "wav2lip")
+START_VIDEO_STAGES = ("sadtalker", "wav2lip", "background")
+PIPELINE_STAGES = ("sadtalker", "wav2lip", "background", "style")
 VIDEO_SOURCE_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4"}
 SUPPORTED_SOURCE_EXTENSIONS = {
     ".avi",
@@ -58,8 +60,8 @@ def _create_intermediate_output_path(output_path: Path, stage_name: str) -> Path
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the Avatar pipeline through SadTalker, background matting, "
-            "and Wav2Lip refinement."
+            "Run the Avatar pipeline through SadTalker, Wav2Lip refinement, "
+            "background matting, and the hologram styling pass."
         )
     )
     speech_source_group = parser.add_mutually_exclusive_group(required=True)
@@ -109,10 +111,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--start-stage",
         default="sadtalker",
-        choices=VIDEO_STAGES,
+        choices=START_VIDEO_STAGES,
         help=(
-            "First video stage to run. Use 'background' to skip SadTalker, or "
-            "'wav2lip' to skip both SadTalker and background matting."
+            "First video stage to run. Use 'wav2lip' to skip SadTalker, or "
+            "'background' to skip both SadTalker and Wav2Lip."
+        ),
+    )
+    parser.add_argument(
+        "--end-stage",
+        default="style",
+        choices=PIPELINE_STAGES,
+        help=(
+            "Last video stage to run. Use 'wav2lip' to stop before background "
+            "removal and styling, or 'background' to stop before styling."
         ),
     )
     parser.add_argument(
@@ -177,9 +188,34 @@ def _validate_start_stage_input(source_media: Path, start_stage: str) -> None:
         )
 
 
-def _requested_video_stages(start_stage: str) -> tuple[str, ...]:
-    start_index = VIDEO_STAGES.index(start_stage)
-    return VIDEO_STAGES[start_index:]
+def _validate_stage_range(start_stage: str, end_stage: str) -> None:
+    start_index = PIPELINE_STAGES.index(start_stage)
+    end_index = PIPELINE_STAGES.index(end_stage)
+    if end_index < start_index:
+        raise SystemExit(
+            f"Invalid stage range: start stage '{start_stage}' comes after end stage "
+            f"'{end_stage}'."
+        )
+
+
+def _requested_video_stages(start_stage: str, end_stage: str) -> tuple[str, ...]:
+    start_index = PIPELINE_STAGES.index(start_stage)
+    end_index = PIPELINE_STAGES.index(end_stage)
+    return PIPELINE_STAGES[start_index : end_index + 1]
+
+
+def _stage_output_path(
+    final_output_path: Path,
+    stage_name: str,
+    requested_stages: tuple[str, ...],
+    intermediate_outputs: list[Path],
+) -> Path:
+    if requested_stages[-1] == stage_name:
+        return final_output_path
+
+    stage_output_path = _create_intermediate_output_path(final_output_path, stage_name)
+    intermediate_outputs.append(stage_output_path)
+    return stage_output_path
 
 
 def main() -> None:
@@ -188,6 +224,7 @@ def main() -> None:
     source_media = Path(args.input).expanduser().resolve()
     _validate_source_media(source_media)
     _validate_start_stage_input(source_media, args.start_stage)
+    _validate_stage_range(args.start_stage, args.end_stage)
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -210,12 +247,16 @@ def main() -> None:
 
     active_video_input = source_media
     intermediate_outputs: list[Path] = []
-    requested_stages = _requested_video_stages(args.start_stage)
+    requested_stages = _requested_video_stages(args.start_stage, args.end_stage)
 
     try:
         if "sadtalker" in requested_stages:
-            sadtalker_output_path = _create_intermediate_output_path(mp4_path, "sadtalker")
-            intermediate_outputs.append(sadtalker_output_path)
+            sadtalker_output_path = _stage_output_path(
+                mp4_path,
+                "sadtalker",
+                requested_stages,
+                intermediate_outputs,
+            )
 
             print(f"Generating talking-head MP4 at {sadtalker_output_path}...")
             generate_talking_head(
@@ -235,9 +276,29 @@ def main() -> None:
             )
             active_video_input = sadtalker_output_path
 
+        if "wav2lip" in requested_stages:
+            wav2lip_output_path = _stage_output_path(
+                mp4_path,
+                "wav2lip",
+                requested_stages,
+                intermediate_outputs,
+            )
+
+            print(f"Generating lip-synced MP4 at {wav2lip_output_path}...")
+            generate_lip_sync(
+                source_media_path=active_video_input,
+                audio_path=wav_path,
+                output_path=wav2lip_output_path,
+            )
+            active_video_input = wav2lip_output_path
+
         if "background" in requested_stages:
-            background_output_path = _create_intermediate_output_path(mp4_path, "background")
-            intermediate_outputs.append(background_output_path)
+            background_output_path = _stage_output_path(
+                mp4_path,
+                "background",
+                requested_stages,
+                intermediate_outputs,
+            )
 
             print(f"Generating background-matted MP4 at {background_output_path}...")
             generate_background_video(
@@ -246,12 +307,12 @@ def main() -> None:
             )
             active_video_input = background_output_path
 
-        print(f"Generating lip-synced MP4 at {mp4_path}...")
-        generate_lip_sync(
-            source_media_path=active_video_input,
-            audio_path=wav_path,
-            output_path=mp4_path,
-        )
+        if "style" in requested_stages:
+            print(f"Generating hologram-styled MP4 at {mp4_path}...")
+            generate_hologram_video(
+                source_media_path=active_video_input,
+                output_path=mp4_path,
+            )
     finally:
         for intermediate_output in intermediate_outputs:
             intermediate_output.unlink(missing_ok=True)

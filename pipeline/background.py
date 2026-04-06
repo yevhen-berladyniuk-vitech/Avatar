@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import fractions
 import importlib.util
 import shutil
@@ -82,6 +83,81 @@ def _resolve_frame_rate(video_stream: object) -> fractions.Fraction:
     if average_rate is not None:
         return average_rate
     return fractions.Fraction(DEFAULT_FRAME_RATE, 1)
+
+
+def _packet_timestamp_seconds(packet: object) -> float:
+    packet_position = packet.pts if packet.pts is not None else packet.dts
+    if packet_position is None or packet.time_base is None:
+        return 0.0
+    return float(packet_position * packet.time_base)
+
+
+def _iter_muxable_packets(
+    container: object,
+    streams: list[object],
+    output_stream_by_index: dict[int, object],
+):
+    for packet in container.demux(streams):
+        if packet.dts is None:
+            continue
+        yield (
+            _packet_timestamp_seconds(packet),
+            packet,
+            output_stream_by_index[packet.stream.index],
+        )
+
+
+def _copy_streams_with_audio(
+    processed_video_path: Path,
+    source_video_path: Path,
+    output_path: Path,
+) -> None:
+    import av
+
+    with av.open(str(source_video_path)) as source_container:
+        audio_streams = [stream for stream in source_container.streams if stream.type == "audio"]
+        if not audio_streams:
+            shutil.copy2(processed_video_path, output_path)
+            return
+
+    with av.open(str(processed_video_path)) as processed_container:
+        processed_video_stream = next(
+            (stream for stream in processed_container.streams if stream.type == "video"),
+            None,
+        )
+        if processed_video_stream is None:
+            raise RuntimeError(f"No processed video stream found in {processed_video_path}")
+
+        with av.open(str(source_video_path)) as source_container:
+            audio_streams = [
+                stream for stream in source_container.streams if stream.type == "audio"
+            ]
+            with av.open(str(output_path), mode="w") as output_container:
+                output_video_stream = output_container.add_stream_from_template(
+                    processed_video_stream
+                )
+                output_audio_streams = {
+                    stream.index: output_container.add_stream_from_template(stream)
+                    for stream in audio_streams
+                }
+
+                merged_packets = heapq.merge(
+                    _iter_muxable_packets(
+                        processed_container,
+                        [processed_video_stream],
+                        {processed_video_stream.index: output_video_stream},
+                    ),
+                    _iter_muxable_packets(
+                        source_container,
+                        audio_streams,
+                        output_audio_streams,
+                    ),
+                    key=lambda item: item[0],
+                )
+
+                for _, packet, output_stream in merged_packets:
+                    packet.stream = output_stream
+                    output_container.mux(packet)
 
 
 def generate_background_video(
@@ -178,7 +254,13 @@ def generate_background_video(
                 "RobustVideoMatting finished without producing the expected output "
                 f"video: {staged_output_path}"
             )
-        shutil.copy2(staged_output_path, output_file)
+        muxed_output_path = workspace_dir / f"{output_file.stem}_muxed{output_file.suffix}"
+        _copy_streams_with_audio(
+            processed_video_path=staged_output_path,
+            source_video_path=source_video,
+            output_path=muxed_output_path,
+        )
+        shutil.move(str(muxed_output_path), str(output_file))
         return output_file
     finally:
         shutil.rmtree(workspace_dir, ignore_errors=True)
