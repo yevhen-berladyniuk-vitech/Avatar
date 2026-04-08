@@ -131,3 +131,9 @@ python3 pipeline/face_crop.py \
   --input samples/input/men.png \
   --output samples/output/men_face.png
 ```
+
+## Face Crop + style
+```bash
+python3 run_face.py --input samples/input/men.png --output-dir samples/output
+python3 run_face.py --input samples/input/women.png --output-dir samples/output
+```

@@ -2,6 +2,9 @@ av
 kokoro
 numpy
 opencv-python-headless
+onnxruntime
+pillow
+rembg
 soundfile
 torch
 torchvision

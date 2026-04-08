@@ -19,8 +19,14 @@ DEFAULT_SCANLINE_SPACING: Final = 4
 DEFAULT_MASK_THRESHOLD: Final = 8
 DEFAULT_SUBJECT_OPACITY: Final = 0.90
 DEFAULT_RANDOM_SEED: Final = 1337
+DEFAULT_EFFECT_REFERENCE_EXTENT: Final = 320.0
+DEFAULT_EFFECT_CANVAS_FILL_RATIO: Final = 0.72
+DEFAULT_EFFECT_MASK_BOUNDS_THRESHOLD: Final = 0.12
+DEFAULT_MAX_EFFECT_SCALE: Final = 4.5
 DEFAULT_TINT_BGR: Final = (255, 230, 140)
 DEFAULT_BACKGROUND_BGR: Final = (110, 42, 16)
+DEFAULT_ALPHA_MASK_THRESHOLD: Final = 0.08
+DEFAULT_ALPHA_SOFT_FLOOR: Final = 0.05
 IMAGE_SOURCE_EXTENSIONS: Final = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 VIDEO_SOURCE_EXTENSIONS: Final = {".avi", ".m4v", ".mkv", ".mov", ".mp4"}
 COMMON_REQUIRED_MODULE_PACKAGES: Final = {
@@ -218,6 +224,58 @@ def _largest_connected_component(cv2_module: object, np_module: object, mask: ob
     return component_mask
 
 
+def _mask_bounds(np_module: object, mask: object) -> Optional[tuple[int, int, int, int]]:
+    mask_points = np_module.column_stack(np_module.where(mask > 0))
+    if mask_points.size == 0:
+        return None
+
+    y_coordinates = mask_points[:, 0]
+    x_coordinates = mask_points[:, 1]
+    return (
+        int(x_coordinates.min()),
+        int(y_coordinates.min()),
+        int(x_coordinates.max()) + 1,
+        int(y_coordinates.max()) + 1,
+    )
+
+
+def _constrain_alpha_portrait_mask(
+    cv2_module: object,
+    np_module: object,
+    binary_mask: object,
+) -> object:
+    bounds = _mask_bounds(np_module, binary_mask)
+    if bounds is None:
+        return binary_mask
+
+    mask_x1, mask_y1, mask_x2, mask_y2 = bounds
+    mask_width = max(1, mask_x2 - mask_x1)
+    mask_height = max(1, mask_y2 - mask_y1)
+    center_x = mask_x1 + (mask_width / 2.0)
+    refined_mask = binary_mask.copy()
+
+    for row in range(mask_y1, mask_y2):
+        vertical_position = (row - mask_y1) / max(mask_height, 1)
+        if vertical_position < 0.10:
+            half_width = mask_width * 0.54
+        elif vertical_position < 0.46:
+            progress = (vertical_position - 0.10) / 0.36
+            half_width = mask_width * (0.54 - (0.06 * progress))
+        elif vertical_position < 0.80:
+            progress = (vertical_position - 0.46) / 0.34
+            half_width = mask_width * (0.48 - (0.08 * progress))
+        else:
+            progress = min(1.0, max(0.0, (vertical_position - 0.80) / 0.20))
+            half_width = mask_width * (0.40 - (0.14 * progress))
+
+        left = max(0, min(binary_mask.shape[1], int(round(center_x - half_width))))
+        right = max(left, min(binary_mask.shape[1], int(round(center_x + half_width))))
+        refined_mask[row, :left] = 0
+        refined_mask[row, right:] = 0
+
+    return _largest_connected_component(cv2_module, np_module, refined_mask)
+
+
 def _extract_subject_mask(
     cv2_module: object,
     np_module: object,
@@ -229,7 +287,11 @@ def _extract_subject_mask(
 ) -> object:
     if subject_alpha is not None:
         alpha_mask = np_module.clip(subject_alpha.astype(np_module.float32), 0.0, 1.0)
-        binary_mask = np_module.where(alpha_mask > 0.02, 255, 0).astype(np_module.uint8)
+        binary_mask = np_module.where(
+            alpha_mask > DEFAULT_ALPHA_MASK_THRESHOLD,
+            255,
+            0,
+        ).astype(np_module.uint8)
     else:
         max_channel = frame.max(axis=2)
         binary_mask = np_module.where(max_channel > mask_threshold, 255, 0).astype(
@@ -259,7 +321,13 @@ def _extract_subject_mask(
         3.0,
     )
     if subject_alpha is not None:
-        soft_mask = np_module.maximum(soft_mask, alpha_mask)
+        alpha_energy = np_module.clip(
+            (alpha_mask - DEFAULT_ALPHA_SOFT_FLOOR)
+            / max(1.0 - DEFAULT_ALPHA_SOFT_FLOOR, 1e-6),
+            0.0,
+            1.0,
+        )
+        soft_mask = np_module.maximum(soft_mask, alpha_energy)
     else:
         energy_mask = np_module.clip(
             (
@@ -373,6 +441,36 @@ def _build_scanlines(
     return np_module.repeat(scanlines, width, axis=1)
 
 
+def _scale_effect_radius(base_radius: float, effect_scale: float, *, minimum: float = 0.01) -> float:
+    return max(minimum, base_radius * effect_scale)
+
+
+def _scale_effect_step(base_step: int, effect_scale: float) -> int:
+    return max(1, int(round(base_step * effect_scale)))
+
+
+def _resolve_effect_scale(np_module: object, mask: object) -> float:
+    height, width = mask.shape
+    effective_extent = float(min(height, width)) * DEFAULT_EFFECT_CANVAS_FILL_RATIO
+    subject_bounds = _mask_bounds(
+        np_module,
+        np_module.where(mask > DEFAULT_EFFECT_MASK_BOUNDS_THRESHOLD, 255, 0).astype(
+            np_module.uint8
+        ),
+    )
+    if subject_bounds is not None:
+        x1, y1, x2, y2 = subject_bounds
+        effective_extent = max(
+            effective_extent,
+            float(max(x2 - x1, y2 - y1)),
+        )
+
+    return min(
+        DEFAULT_MAX_EFFECT_SCALE,
+        max(1.0, effective_extent / DEFAULT_EFFECT_REFERENCE_EXTENT),
+    )
+
+
 def _build_reference_dot_layer(
     cv2_module: object,
     np_module: object,
@@ -381,11 +479,15 @@ def _build_reference_dot_layer(
     edge_map: object,
     warm_map: object,
     *,
+    effect_scale: float,
     frame_index: int,
 ) -> object:
     height, width = mask.shape
-    step_x = 4
-    step_y = 4
+    step_x = _scale_effect_step(4, effect_scale)
+    step_y = _scale_effect_step(4, effect_scale)
+    dot_sigma = _scale_effect_radius(1.18, effect_scale)
+    dot_blur_sigma = _scale_effect_radius(0.64, effect_scale)
+    highlight_sigma = _scale_effect_radius(0.9, effect_scale)
     grid_width = max(1, (width + step_x - 1) // step_x)
     grid_height = max(1, (height + step_y - 1) // step_y)
 
@@ -516,16 +618,21 @@ def _build_reference_dot_layer(
     dy = np_module.minimum(dy, step_y - dy)
     dx = np_module.mod(x_coords - (step_x / 2.0), step_x)
     dx = np_module.minimum(dx, step_x - dx)
-    dot_kernel = np_module.exp(-((dx ** 2) + (dy ** 2)) / (2.0 * (1.18 ** 2)))
+    dot_kernel = np_module.exp(-((dx ** 2) + (dy ** 2)) / (2.0 * (dot_sigma ** 2)))
 
     dot_field = upsampled_field * dot_kernel
     dot_field = np_module.clip(
-        (dot_field * 1.06) + (cv2_module.GaussianBlur(dot_field, (0, 0), 0.64) * 0.22),
+        (dot_field * 1.06)
+        + (cv2_module.GaussianBlur(dot_field, (0, 0), dot_blur_sigma) * 0.22),
         0.0,
         1.0,
     )
 
-    highlight_core = cv2_module.GaussianBlur((contrast_luma ** 6.2) * mask, (0, 0), 0.9)
+    highlight_core = cv2_module.GaussianBlur(
+        (contrast_luma ** 6.2) * mask,
+        (0, 0),
+        highlight_sigma,
+    )
     highlight_core = np_module.clip(highlight_core, 0.0, 1.0)
 
     blue = np_module.clip(
@@ -555,13 +662,20 @@ def _build_aura_particles(
     mask: object,
     edge_map: object,
     *,
+    effect_scale: float,
     frame_index: int,
 ) -> object:
     height, width = mask.shape
-    aura_shell = cv2_module.GaussianBlur(mask.astype(np_module.float32), (0, 0), 14.0)
+    aura_shell = cv2_module.GaussianBlur(
+        mask.astype(np_module.float32),
+        (0, 0),
+        _scale_effect_radius(14.0, effect_scale),
+    )
     aura_shell = np_module.clip(aura_shell - (mask * 0.22), 0.0, 1.0)
 
-    step = 5
+    step = _scale_effect_step(5, effect_scale)
+    particle_sigma = _scale_effect_radius(0.86, effect_scale)
+    particle_blur_sigma = _scale_effect_radius(1.0, effect_scale)
     grid_width = max(1, (width + step - 1) // step)
     grid_height = max(1, (height + step - 1) // step)
     sampled_shell = cv2_module.resize(
@@ -609,11 +723,13 @@ def _build_aura_particles(
     dy = np_module.minimum(dy, step - dy)
     dx = np_module.mod(x_coords - (step / 2.0), step)
     dx = np_module.minimum(dx, step - dx)
-    particle_kernel = np_module.exp(-((dx ** 2) + (dy ** 2)) / (2.0 * (0.86 ** 2)))
+    particle_kernel = np_module.exp(
+        -((dx ** 2) + (dy ** 2)) / (2.0 * (particle_sigma ** 2))
+    )
     particle_field = upsampled_particles * particle_kernel
     particle_field = np_module.clip(
         (particle_field * 1.45)
-        + (cv2_module.GaussianBlur(particle_field, (0, 0), 1.0) * 0.45),
+        + (cv2_module.GaussianBlur(particle_field, (0, 0), particle_blur_sigma) * 0.45),
         0.0,
         1.0,
     )
@@ -630,15 +746,26 @@ def _build_edge_dispersion(
     edge_map: object,
     warm_map: object,
     *,
+    effect_scale: float,
     frame_index: int,
 ) -> object:
     height, width = mask.shape
-    inner_blur = cv2_module.GaussianBlur(mask.astype(np_module.float32), (0, 0), 4.8)
-    outer_blur = cv2_module.GaussianBlur(mask.astype(np_module.float32), (0, 0), 18.0)
+    inner_blur = cv2_module.GaussianBlur(
+        mask.astype(np_module.float32),
+        (0, 0),
+        _scale_effect_radius(4.8, effect_scale),
+    )
+    outer_blur = cv2_module.GaussianBlur(
+        mask.astype(np_module.float32),
+        (0, 0),
+        _scale_effect_radius(18.0, effect_scale),
+    )
     edge_shell = np_module.clip(outer_blur - (inner_blur * 0.72), 0.0, 1.0)
     perimeter_energy = np_module.clip((edge_map * 0.28) + (edge_shell * 1.12), 0.0, 1.0)
 
-    step = 6
+    step = _scale_effect_step(6, effect_scale)
+    particle_sigma = _scale_effect_radius(1.40, effect_scale)
+    edge_blur_sigma = _scale_effect_radius(2.2, effect_scale)
     grid_width = max(1, (width + step - 1) // step)
     grid_height = max(1, (height + step - 1) // step)
     sampled_energy = cv2_module.resize(
@@ -683,11 +810,13 @@ def _build_edge_dispersion(
     dy = np_module.minimum(dy, step - dy)
     dx = np_module.mod(x_coords - (step / 2.0), step)
     dx = np_module.minimum(dx, step - dx)
-    particle_kernel = np_module.exp(-((dx ** 2) + (dy ** 2)) / (2.0 * (1.40 ** 2)))
+    particle_kernel = np_module.exp(
+        -((dx ** 2) + (dy ** 2)) / (2.0 * (particle_sigma ** 2))
+    )
     edge_particles = upsampled_edge_values * particle_kernel
     edge_particles = np_module.clip(
         (edge_particles * 1.58)
-        + (cv2_module.GaussianBlur(edge_particles, (0, 0), 2.2) * 0.78),
+        + (cv2_module.GaussianBlur(edge_particles, (0, 0), edge_blur_sigma) * 0.78),
         0.0,
         1.0,
     )
@@ -774,6 +903,7 @@ def _apply_hologram_effect(
     rng: object,
 ) -> object:
     height, width = frame.shape[:2]
+    effect_scale = _resolve_effect_scale(np_module, mask)
     frame_float = frame.astype(np_module.float32) / 255.0
     luminance = cv2_module.cvtColor(frame, cv2_module.COLOR_BGR2GRAY).astype(np_module.float32)
     luminance /= 255.0
@@ -781,20 +911,40 @@ def _apply_hologram_effect(
     contrast_luma = cv2_module.equalizeHist((luminance * 255).astype(np_module.uint8))
     contrast_luma = contrast_luma.astype(np_module.float32) / 255.0
     contrast_luma = (luminance * 0.58) + (contrast_luma * 0.42)
-    contrast_luma = cv2_module.GaussianBlur(contrast_luma, (0, 0), 0.8)
+    contrast_luma = cv2_module.GaussianBlur(
+        contrast_luma,
+        (0, 0),
+        _scale_effect_radius(0.8, effect_scale),
+    )
     contrast_luma = np_module.clip(contrast_luma, 0.0, 1.0) ** 1.12
-    soft_subject = cv2_module.GaussianBlur(mask.astype(np_module.float32), (0, 0), 4.8)
-    feather_subject = cv2_module.GaussianBlur(mask.astype(np_module.float32), (0, 0), 9.0)
-    outer_subject = cv2_module.GaussianBlur(mask.astype(np_module.float32), (0, 0), 18.0)
+    soft_subject = cv2_module.GaussianBlur(
+        mask.astype(np_module.float32),
+        (0, 0),
+        _scale_effect_radius(4.8, effect_scale),
+    )
+    feather_subject = cv2_module.GaussianBlur(
+        mask.astype(np_module.float32),
+        (0, 0),
+        _scale_effect_radius(9.0, effect_scale),
+    )
+    outer_subject = cv2_module.GaussianBlur(
+        mask.astype(np_module.float32),
+        (0, 0),
+        _scale_effect_radius(18.0, effect_scale),
+    )
 
-    aura_mask = cv2_module.GaussianBlur(mask, (0, 0), 16.0)
+    aura_mask = cv2_module.GaussianBlur(
+        mask,
+        (0, 0),
+        _scale_effect_radius(16.0, effect_scale),
+    )
     aura_mask = np_module.clip(aura_mask - (mask * 0.08), 0.0, 1.0)
 
     edge_map = cv2_module.Canny((contrast_luma * 255).astype(np_module.uint8), 34, 92)
     edge_map = cv2_module.GaussianBlur(
         edge_map.astype(np_module.float32) / 255.0,
         (0, 0),
-        1.0,
+        _scale_effect_radius(1.0, effect_scale),
     )
     edge_map *= mask
     edge_color = edge_map[..., None] * np_module.array([1.0, 0.96, 0.72], dtype=np_module.float32)
@@ -812,7 +962,11 @@ def _apply_hologram_effect(
         1.0,
     )
     warm_accent *= mask
-    warm_accent = cv2_module.GaussianBlur(warm_accent, (0, 0), 1.1)
+    warm_accent = cv2_module.GaussianBlur(
+        warm_accent,
+        (0, 0),
+        _scale_effect_radius(1.1, effect_scale),
+    )
 
     dot_layer = _build_reference_dot_layer(
         cv2_module,
@@ -821,6 +975,7 @@ def _apply_hologram_effect(
         feather_subject,
         edge_map,
         warm_accent,
+        effect_scale=effect_scale,
         frame_index=frame_index,
     )
     aura_particles = _build_aura_particles(
@@ -828,6 +983,7 @@ def _apply_hologram_effect(
         np_module,
         mask,
         edge_map,
+        effect_scale=effect_scale,
         frame_index=frame_index,
     )
     edge_dispersion = _build_edge_dispersion(
@@ -836,21 +992,38 @@ def _apply_hologram_effect(
         mask,
         edge_map,
         warm_accent,
+        effect_scale=effect_scale,
         frame_index=frame_index,
     )
     display_texture = 1.0
 
     source_reflection = frame_float * feather_subject[..., None]
     source_reflection *= np_module.array([0.06, 0.04, 0.04], dtype=np_module.float32)
-    source_reflection = cv2_module.GaussianBlur(source_reflection, (0, 0), 0.8)
+    source_reflection = cv2_module.GaussianBlur(
+        source_reflection,
+        (0, 0),
+        _scale_effect_radius(0.8, effect_scale),
+    )
 
-    core_glow = cv2_module.GaussianBlur(dot_layer, (0, 0), 1.2)
-    halo_glow = cv2_module.GaussianBlur(dot_layer, (0, 0), 3.8)
-    edge_haze = cv2_module.GaussianBlur(edge_dispersion, (0, 0), 4.0)
+    core_glow = cv2_module.GaussianBlur(
+        dot_layer,
+        (0, 0),
+        _scale_effect_radius(1.2, effect_scale),
+    )
+    halo_glow = cv2_module.GaussianBlur(
+        dot_layer,
+        (0, 0),
+        _scale_effect_radius(3.8, effect_scale),
+    )
+    edge_haze = cv2_module.GaussianBlur(
+        edge_dispersion,
+        (0, 0),
+        _scale_effect_radius(4.0, effect_scale),
+    )
     highlight_glow = cv2_module.GaussianBlur(
         (contrast_luma ** 6.0) * mask * portrait_focus,
         (0, 0),
-        1.9,
+        _scale_effect_radius(1.9, effect_scale),
     )
     highlight_glow = highlight_glow[..., None] * np_module.array(
         [1.0, 1.0, 1.0],
@@ -859,13 +1032,24 @@ def _apply_hologram_effect(
     white_core = cv2_module.GaussianBlur(
         (contrast_luma ** 8.0) * mask * portrait_focus,
         (0, 0),
-        0.7,
+        _scale_effect_radius(0.7, effect_scale),
     )[..., None]
 
-    ghost_x = int(round(1.0 + (1.5 * np_module.sin(frame_index * 0.08))))
-    ghost_y = int(round(0.6 * np_module.cos(frame_index * 0.06)))
+    ghost_x = int(
+        round(
+            _scale_effect_radius(1.0, effect_scale)
+            + (_scale_effect_radius(1.5, effect_scale) * np_module.sin(frame_index * 0.08))
+        )
+    )
+    ghost_y = int(
+        round(_scale_effect_radius(0.6, effect_scale) * np_module.cos(frame_index * 0.06))
+    )
     chromatic_ghost = np_module.roll(dot_layer, shift=(ghost_y, ghost_x), axis=(0, 1))
-    chromatic_ghost = cv2_module.GaussianBlur(chromatic_ghost, (0, 0), 0.9)
+    chromatic_ghost = cv2_module.GaussianBlur(
+        chromatic_ghost,
+        (0, 0),
+        _scale_effect_radius(0.9, effect_scale),
+    )
 
     background = _build_reference_background(
         np_module,
@@ -902,7 +1086,11 @@ def _apply_hologram_effect(
     subject_layers = cv2_module.addWeighted(
         subject_layers,
         1.01,
-        cv2_module.GaussianBlur(subject_layers, (0, 0), 0.65),
+        cv2_module.GaussianBlur(
+            subject_layers,
+            (0, 0),
+            _scale_effect_radius(0.65, effect_scale),
+        ),
         -0.01,
         0.0,
     )
